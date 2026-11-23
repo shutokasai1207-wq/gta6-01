@@ -1,235 +1,135 @@
-// The city of Solara Bay: a grid of sun-bleached blocks between wide streets, built
-// once from the run's seed. This file owns the map's facts — where the roads run,
-// which buildings stand (and block movement), where the named places are — and the
-// collision answers every mover asks. Rendering lives in render.js; this is data.
-import {
-  BEACH_Y, BLOCK, COLS, GRID_X, GRID_Y, ROAD, ROWS, WORLD,
-} from './config.js';
-import { clamp } from './random.js';
+// city.js — the layout of Solara Bay.
+//
+// A grid of city blocks separated by two-lane roads. Most blocks hold one
+// building (a solid the player and cars collide with); eight hold the named
+// places the story visits, each with an open forecourt and a job marker.
+// A few blocks are parks or parking lots you can cut across.
 
-/** Distance from one road's edge to the next: a block plus the road after it. */
-export const PITCH = BLOCK + ROAD;
+export const BLOCK = 250; // block size in world pixels
+export const ROAD = 96; // road width between blocks
+export const COLS = 6;
+export const ROWS = 5;
+export const LANE = 20; // lane offset from a road's centre line
 
-const ROOFS = ['roofA', 'roofB', 'roofC', 'roofD', 'roofE'];
+export const WORLD_W = COLS * BLOCK + (COLS + 1) * ROAD;
+export const WORLD_H = ROWS * BLOCK + (ROWS + 1) * ROAD;
 
-/** Named places the jobs revolve around, pinned to blocks of the grid. */
-const POI_SPOTS = [
-  { id: 'diner', name: "Sol's Diner", col: 1, row: 1 },
-  { id: 'hotel', name: 'Hotel Palmera', col: 4, row: 0 },
-  { id: 'airstrip', name: 'Solara Airstrip', col: 6, row: 0 },
-  { id: 'bank', name: 'Banco Solara', col: 3, row: 2 },
-  { id: 'garage', name: "Tito's Auto", col: 0, row: 3 },
-  { id: 'club', name: 'Club Neon Palms', col: 5, row: 3 },
-  { id: 'market', name: 'Mercado Sol', col: 2, row: 4 },
-  { id: 'marina', name: 'Marina Del Sol', col: 6, row: 4 },
+// The named places, by block (col, row), with the colour of their sign.
+const PLACE_DEFS = [
+  { col: 0, row: 0, name: "Sol's Diner", sign: '#ffb347' },
+  { col: 2, row: 0, name: 'Hotel Palmera', sign: '#7fe3c0' },
+  { col: 4, row: 0, name: 'Banco Solara', sign: '#ffd94d' },
+  { col: 3, row: 1, name: 'Club Neon Palms', sign: '#ff5fd2' },
+  { col: 1, row: 2, name: "Tito's Auto", sign: '#8fd0ff' },
+  { col: 5, row: 2, name: 'Mercado Sol', sign: '#ff8a5c' },
+  { col: 0, row: 4, name: 'Marina Del Sol', sign: '#5cc8ff' },
+  { col: 5, row: 4, name: 'Solara Airstrip', sign: '#e8e8e8' },
 ];
 
-/** West edge of block column `col` (its sidewalk line, just east of its road). */
-export function blockX(col) {
-  return GRID_X + col * PITCH + ROAD;
+const BUILDING_COLORS = ['#d96f4e', '#c95d63', '#e0a458', '#9c6b30', '#b5525f', '#7a9e7e', '#5f8d87', '#c2b280', '#a26769', '#6d597a'];
+const ROOF_COLORS = ['#8a4b2f', '#74404a', '#a5763a', '#6e5226', '#7d3a44', '#55705a', '#40635e', '#8f8262', '#6e4548', '#4c3f5e'];
+
+export function blockRect(col, row) {
+  return {
+    x: ROAD + col * (BLOCK + ROAD),
+    y: ROAD + row * (BLOCK + ROAD),
+    w: BLOCK,
+    h: BLOCK,
+  };
 }
 
-/** North edge of block row `row`. */
-export function blockY(row) {
-  return GRID_Y + row * PITCH + ROAD;
-}
-
-/** Centre line of the vertical road west of block column `col` (col may be COLS). */
-export function vRoadCenter(col) {
-  return GRID_X + col * PITCH + ROAD / 2;
-}
-
-/** Centre line of the horizontal road north of block row `row` (row may be ROWS). */
-export function hRoadCenter(row) {
-  return GRID_Y + row * PITCH + ROAD / 2;
-}
-
-/**
- * Build the whole city from `random`. Returns plain data:
- * buildings (solid boxes with a roof colour key and an optional place name),
- * palms (round solids), blocks (what kind of block each cell is), pois by id,
- * and the road centre lines the traffic and the minimap both read.
- */
-export function buildCity(random) {
-  const buildings = [];
-  const palms = [];
+export function buildCity(rng) {
   const blocks = [];
-  const pois = new Map();
+  const places = new Map();
+  const placeAt = new Map(PLACE_DEFS.map((p) => [`${p.col},${p.row}`, p]));
 
-  const poiByCell = new Map(POI_SPOTS.map((spot) => [`${spot.col},${spot.row}`, spot]));
-
-  for (let row = 0; row < ROWS; row += 1) {
-    for (let col = 0; col < COLS; col += 1) {
-      const x = blockX(col);
-      const y = blockY(row);
-      const spot = poiByCell.get(`${col},${row}`);
-      let kind = 'built';
-
-      if (spot && spot.id === 'airstrip') {
-        kind = 'airstrip'; // one flat runway strip, no buildings at all
-      } else if (!spot && random.chance(0.14)) {
-        kind = 'park';
-      } else if (!spot && random.chance(0.13)) {
-        kind = 'lot'; // open parking: parked cars live here (entities.js fills it)
-      }
-
-      if (kind === 'built') fillBuiltBlock(random, buildings, palms, x, y, spot);
-      if (kind === 'park') fillParkBlock(random, palms, x, y);
-      blocks.push({ col, row, x, y, kind });
-
-      if (spot) {
-        pois.set(spot.id, {
-          id: spot.id,
-          name: spot.name,
-          // The meeting point: on the sidewalk at the block's south edge, street side.
-          x: x + BLOCK / 2,
-          y: y + BLOCK + 26,
-          blockX: x,
-          blockY: y,
+  for (let row = 0; row < ROWS; row++) {
+    for (let col = 0; col < COLS; col++) {
+      const r = blockRect(col, row);
+      const def = placeAt.get(`${col},${row}`);
+      if (def) {
+        // The building sits at the back of its block; the front is an open
+        // forecourt where the job marker glows.
+        const solid = { x: r.x + 20, y: r.y + 16, w: r.w - 40, h: Math.round(r.h * 0.52) };
+        const block = {
+          ...r, col, row, kind: 'place', name: def.name, sign: def.sign,
+          color: rng.pick(BUILDING_COLORS), roof: rng.pick(ROOF_COLORS), solid,
+          marker: { x: r.x + r.w / 2, y: r.y + r.h * 0.82 },
+        };
+        blocks.push(block);
+        places.set(def.name, block);
+      } else if (rng.chance(0.14)) {
+        // A park: grass, a path cross, and palms at fixed spots the renderer
+        // and the screenshot scenes can rely on.
+        const palms = [];
+        const count = rng.int(3, 6);
+        for (let i = 0; i < count; i++) {
+          palms.push({ x: r.x + rng.range(28, r.w - 28), y: r.y + rng.range(28, r.h - 28), s: rng.range(0.8, 1.3) });
+        }
+        blocks.push({ ...r, col, row, kind: 'park', name: '', solid: null, palms });
+      } else if (rng.chance(0.14)) {
+        // A parking lot: two rows of bays along the block's long edges.
+        const spots = [];
+        for (let i = 0; i < 5; i++) {
+          spots.push({ x: r.x + 34 + i * 46, y: r.y + 40, angle: Math.PI / 2 });
+          spots.push({ x: r.x + 34 + i * 46, y: r.y + r.h - 40, angle: -Math.PI / 2 });
+        }
+        blocks.push({ ...r, col, row, kind: 'parking', name: '', solid: null, spots });
+      } else {
+        const solid = { x: r.x + 16, y: r.y + 16, w: r.w - 32, h: r.h - 32 };
+        blocks.push({
+          ...r, col, row, kind: 'building', name: '', solid,
+          color: rng.pick(BUILDING_COLORS), roof: rng.pick(ROOF_COLORS),
+          floors: rng.int(2, 6),
         });
       }
     }
   }
 
-  // Palms line the boardwalk above the beach.
-  for (let x = 180; x < WORLD.width - 120; x += 150) {
-    palms.push({ x: x + random.range(-24, 24), y: BEACH_Y + 34, r: 7 });
-  }
+  // Road centre lines: vertical roads run between and around the columns.
+  const vRoads = [];
+  for (let i = 0; i <= COLS; i++) vRoads.push(i * (BLOCK + ROAD) + ROAD / 2);
+  const hRoads = [];
+  for (let j = 0; j <= ROWS; j++) hRoads.push(j * (BLOCK + ROAD) + ROAD / 2);
 
-  return {
-    buildings,
-    palms,
-    blocks,
-    pois,
-    vRoads: Array.from({ length: COLS + 1 }, (_, i) => vRoadCenter(i)),
-    hRoads: Array.from({ length: ROWS + 1 }, (_, i) => hRoadCenter(i)),
-  };
+  const solids = blocks.filter((b) => b.solid).map((b) => b.solid);
+  return { width: WORLD_W, height: WORLD_H, blocks, places, vRoads, hRoads, solids };
 }
 
-/** Fill a built block: one landmark building for a named place, else 2–4 smaller ones. */
-function fillBuiltBlock(random, buildings, palms, x, y, spot) {
-  const inset = 26; // sidewalk inside the block's edge
-  if (spot) {
-    const w = BLOCK - inset * 2;
-    const h = BLOCK - inset * 2 - 40;
-    buildings.push({
-      x: x + inset, y: y + inset, w, h,
-      roof: random.pick(ROOFS), name: spot.name, floors: random.int(3, 9),
-    });
-    scatterPalms(random, palms, x, y, 2);
-    return;
-  }
-  const across = random.chance(0.5) ? 2 : 1;
-  const down = random.chance(0.5) ? 2 : 1;
-  const gap = 18;
-  const cellW = (BLOCK - inset * 2 - gap * (across - 1)) / across;
-  const cellH = (BLOCK - inset * 2 - gap * (down - 1)) / down;
-  for (let i = 0; i < across; i += 1) {
-    for (let j = 0; j < down; j += 1) {
-      const shrink = random.range(0, 14);
-      buildings.push({
-        x: x + inset + i * (cellW + gap) + shrink / 2,
-        y: y + inset + j * (cellH + gap) + shrink / 2,
-        w: cellW - shrink,
-        h: cellH - shrink,
-        roof: random.pick(ROOFS),
-        name: null,
-        floors: random.int(2, 12),
-      });
+// Where a place's job marker sits (its forecourt).
+export function placeMarker(city, name) {
+  const block = city.places.get(name);
+  return block ? block.marker : { x: city.width / 2, y: city.height / 2 };
+}
+
+// Circle vs the city's building solids: returns a push-out vector or null.
+export function collideSolids(city, x, y, radius) {
+  for (const s of city.solids) {
+    const nx = Math.max(s.x, Math.min(x, s.x + s.w));
+    const ny = Math.max(s.y, Math.min(y, s.y + s.h));
+    const dx = x - nx;
+    const dy = y - ny;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < radius * radius) {
+      if (d2 > 0.0001) {
+        const d = Math.sqrt(d2);
+        return { x: nx + (dx / d) * radius, y: ny + (dy / d) * radius };
+      }
+      // Centre inside the rect: push out through the nearest face.
+      const left = x - s.x, right = s.x + s.w - x, top = y - s.y, bottom = s.y + s.h - y;
+      const m = Math.min(left, right, top, bottom);
+      if (m === left) return { x: s.x - radius, y };
+      if (m === right) return { x: s.x + s.w + radius, y };
+      if (m === top) return { x, y: s.y - radius };
+      return { x, y: s.y + s.h + radius };
     }
   }
-  scatterPalms(random, palms, x, y, random.int(1, 3));
+  return null;
 }
 
-/** A park block: no buildings, a knot of palms to weave between. */
-function fillParkBlock(random, palms, x, y) {
-  scatterPalms(random, palms, x, y, random.int(6, 10));
-}
-
-/** Drop `count` palms at random spots inside a block, kept off its centre paths. */
-function scatterPalms(random, palms, x, y, count) {
-  for (let i = 0; i < count; i += 1) {
-    palms.push({
-      x: x + random.range(18, BLOCK - 18),
-      y: y + random.range(18, BLOCK - 18),
-      r: 7,
-    });
-  }
-}
-
-/** Is the point on asphalt (a road or the airstrip) rather than on a block? */
-export function isOnRoad(city, x, y) {
-  if (y >= BEACH_Y) return false;
-  if (x < GRID_X || y < GRID_Y) return true; // the border streets
-  const localX = (x - GRID_X) % PITCH;
-  const localY = (y - GRID_Y) % PITCH;
-  return localX < ROAD || localY < ROAD;
-}
-
-/**
- * Push a circle (a mover at x, y with radius r) out of every solid it overlaps:
- * building boxes and palm trunks. Returns the corrected point and what it hit,
- * so callers can charge damage or heat for the contact.
- */
-export function collideSolids(city, x, y, r) {
-  let hit = false;
-  let hitBuilding = false;
-  for (const b of city.buildings) {
-    const nearX = clamp(x, b.x, b.x + b.w);
-    const nearY = clamp(y, b.y, b.y + b.h);
-    const dx = x - nearX;
-    const dy = y - nearY;
-    const d2 = dx * dx + dy * dy;
-    if (d2 >= r * r) continue;
-    hit = true;
-    hitBuilding = true;
-    if (d2 > 0.0001) {
-      const d = Math.sqrt(d2);
-      x = nearX + (dx / d) * r;
-      y = nearY + (dy / d) * r;
-    } else {
-      // Centre inside the box: leave by the nearest face.
-      const left = x - b.x;
-      const right = b.x + b.w - x;
-      const top = y - b.y;
-      const bottom = b.y + b.h - y;
-      const min = Math.min(left, right, top, bottom);
-      if (min === left) x = b.x - r;
-      else if (min === right) x = b.x + b.w + r;
-      else if (min === top) y = b.y - r;
-      else y = b.y + b.h + r;
-    }
-  }
-  for (const p of city.palms) {
-    const dx = x - p.x;
-    const dy = y - p.y;
-    const rr = r + p.r;
-    const d2 = dx * dx + dy * dy;
-    if (d2 >= rr * rr || d2 === 0) continue;
-    hit = true;
-    const d = Math.sqrt(d2);
-    x = p.x + (dx / d) * rr;
-    y = p.y + (dy / d) * rr;
-  }
-  // The world border is solid on all four sides.
-  if (x < r) { x = r; hit = true; }
-  if (y < r) { y = r; hit = true; }
-  if (x > WORLD.width - r) { x = WORLD.width - r; hit = true; }
-  if (y > WORLD.height - r) { y = WORLD.height - r; hit = true; }
-  return { x, y, hit, hitBuilding };
-}
-
-/** A random point on a random road, clear of intersections — traffic's spawn roll. */
-export function randomRoadPoint(random, city) {
-  const vertical = random.chance(0.5);
-  if (vertical) {
-    return {
-      x: random.pick(city.vRoads),
-      y: random.range(GRID_Y + ROAD, BEACH_Y - ROAD),
-    };
-  }
+export function clampWorld(city, x, y, radius) {
   return {
-    x: random.range(GRID_X + ROAD, WORLD.width - GRID_X - ROAD),
-    y: random.pick(city.hRoads),
+    x: Math.max(radius, Math.min(city.width - radius, x)),
+    y: Math.max(radius, Math.min(city.height - radius, y)),
   };
 }

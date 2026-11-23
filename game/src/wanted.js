@@ -1,142 +1,101 @@
-// The law: a heat score that every crime feeds and time out of sight cools, five
-// stars of police attention, patrol cars that hunt the player down, and the slow
-// grab of an arrest when they pin a slow target. Police cars live in the same
-// state.cars list as everyone else; this file owns their brains.
-import { BUST_RANGE, BUST_TIME, HEAT, POLICE_BY_STAR } from './config.js';
-import { randomRoadPoint } from './city.js';
-import { stepCar } from './entities.js';
-import { angleDelta, clamp, distance } from './random.js';
+// wanted.js — the heat system: stars, police response and getting busted.
+//
+// Crimes add heat. Heat sets the star level, the star level sets how many
+// patrol cars hunt the player, and a patrol car that stays close to a slow
+// or on-foot player fills the bust meter. Fill it and the run ends on the
+// arrested screen. Break line of sight and the heat bleeds away.
 
-/** Attach the wanted record to a fresh world. */
-export function createWanted(state) {
-  state.wanted = { heat: 0, stars: 0, bust: 0, seen: false };
-  return state.wanted;
+import { makeCar } from './entities.js';
+
+export function makeWanted() {
+  return { heat: 0, stars: 0, bust: 0, seen: false, giveUpT: 0 };
 }
 
-/** Add raw heat points (missions use this for scripted attention). */
+export function starsForHeat(heat) {
+  if (heat <= 0) return 0;
+  if (heat < 25) return 1;
+  if (heat < 55) return 2;
+  if (heat < 95) return 3;
+  if (heat < 145) return 4;
+  return 5;
+}
+
 export function addHeat(state, points) {
   const w = state.wanted;
-  w.heat = clamp(w.heat + points, 0, HEAT.perStar * HEAT.maxStars);
+  w.heat = Math.min(220, w.heat + points);
+  w.stars = starsForHeat(w.heat);
 }
 
-/** Turn the step's news into heat: crimes the world reported, priced by the table. */
-function priceEvents(state) {
-  const ev = state.events;
-  if (state.pendingSteal !== null && state.pendingSteal !== undefined) {
-    addHeat(state, state.pendingSteal ? HEAT.stealWitnessed : HEAT.stealCar);
-    state.pendingSteal = null;
-  }
-  if (ev.hitPed) addHeat(state, HEAT.hitPed);
-  if (ev.hitPolice) addHeat(state, HEAT.hitPolice);
-  if (ev.hitCar) addHeat(state, HEAT.hitCar);
-  if (ev.hitBuilding) addHeat(state, HEAT.hitBuilding);
-  if (ev.ramRival) addHeat(state, HEAT.ramRival);
-}
-
-/** Bring one police car onto a road a good way from the player. */
-function spawnPolice(state) {
-  const { random, city } = state;
-  let x = 0;
-  let y = 0;
-  for (let tries = 0; tries < 12; tries += 1) {
-    const at = randomRoadPoint(random, city);
-    x = at.x;
-    y = at.y;
-    const d = distance(x, y, state.player.x, state.player.y);
-    if (d > 640 && d < 1150) break;
-  }
-  const car = {
-    id: 9000 + state.cars.length, x, y, angle: random.range(0, Math.PI * 2),
-    vx: 0, vy: 0, speed: 0, color: '#20303c', kind: 'police',
-    health: 130, driver: 'ai', ai: { leave: false }, dead: false, flash: 0,
-  };
-  state.cars.push(car);
-}
-
-/** One officer's driving: hunt the player, press close, never run down a walker. */
-function stepPoliceCar(state, car, dt) {
+function spawnPoint(state) {
+  const city = state.city;
   const p = state.player;
-  const ai = car.ai;
-  const dist = distance(car.x, car.y, p.x, p.y);
-
-  if (ai.leave) {
-    // Attention moved on: drive off and, once far away, be gone.
-    const away = Math.atan2(car.y - p.y, car.x - p.x);
-    const steer = clamp(angleDelta(car.angle, away) * 2.4, -1, 1);
-    stepCar(state, car, car.speed < 260 ? 0.8 : 0, steer, false, dt);
-    car.ai.gone = dist > 1150;
-    return;
-  }
-
-  // Aim where the player is heading, not where they were.
-  const lead = p.car ? clamp(dist / 300, 0, 0.55) : 0;
-  const tx = p.x + (p.car ? p.car.vx * lead : 0);
-  const ty = p.y + (p.car ? p.car.vy * lead : 0);
-  const desired = Math.atan2(ty - car.y, tx - car.x);
-  const steer = clamp(angleDelta(car.angle, desired) * 2.8, -1, 1);
-
-  let throttle;
-  if (!p.car) {
-    // On foot the arrest is the weapon: pull up alongside and stay there, close
-    // enough to grab — braking rather than running the player down.
-    if (dist > 46) throttle = dist > 130 ? 1 : dist > 70 ? 0.55 : 0.3;
-    else throttle = car.speed > 14 ? -0.7 : 0;
-  } else if (dist > 130) {
-    throttle = 1;
-  } else if (dist > 55) {
-    throttle = 0.55;
-  } else {
-    throttle = state.wanted.stars >= 3 ? 0.5 : 0.15; // high heat rams; low heat shadows
-  }
-  stepCar(state, car, throttle, steer, false, dt);
-  car.flash += dt;
+  const angle = state.rng.range(0, Math.PI * 2);
+  let x = p.x + Math.cos(angle) * 660;
+  let y = p.y + Math.sin(angle) * 660;
+  x = Math.max(30, Math.min(city.width - 30, x));
+  y = Math.max(30, Math.min(city.height - 30, y));
+  // Snap to the nearer road centre line so the patrol starts on a street.
+  let bestV = city.vRoads[0], bestVd = Infinity;
+  for (const vx of city.vRoads) { const d = Math.abs(vx - x); if (d < bestVd) { bestVd = d; bestV = vx; } }
+  let bestH = city.hRoads[0], bestHd = Infinity;
+  for (const hy of city.hRoads) { const d = Math.abs(hy - y); if (d < bestHd) { bestHd = d; bestH = hy; } }
+  if (bestVd < bestHd) x = bestV; else y = bestH;
+  return { x, y };
 }
 
-/**
- * One step of the law: price the news, cool or stoke the heat, keep the patrol at
- * the size the stars demand, drive it, and run the arrest clock.
- */
 export function stepWanted(state, dt) {
   const w = state.wanted;
   const p = state.player;
-  priceEvents(state);
-  w.stars = Math.min(HEAT.maxStars, Math.floor(w.heat / HEAT.perStar));
+  const px = p.car ? p.car.x : p.x;
+  const py = p.car ? p.car.y : p.y;
 
-  const police = state.cars.filter((c) => c.kind === 'police' && c.driver === 'ai');
-  w.seen = police.some((c) => !c.dead && distance(c.x, c.y, p.x, p.y) < HEAT.sightRange);
-  if (!w.seen && w.stars > 0) {
-    w.heat = Math.max(0, w.heat - HEAT.decayPerSecond * dt);
-    w.stars = Math.min(HEAT.maxStars, Math.floor(w.heat / HEAT.perStar));
+  const police = state.cars.filter((c) => c.kind === 'police');
+
+  // Line of sight: any patrol within 340 px sees the player.
+  w.seen = police.some((c) => Math.hypot(c.x - px, c.y - py) < 340);
+
+  // Heat bleeds off only while nobody is watching.
+  if (!w.seen && w.heat > 0) {
+    w.heat = Math.max(0, w.heat - 5.5 * dt);
+    w.stars = starsForHeat(w.heat);
   }
 
-  // The patrol grows and shrinks with the stars.
-  const wanted = POLICE_BY_STAR[w.stars];
-  const active = police.filter((c) => !c.ai.leave);
-  if (active.length < wanted) {
-    for (let i = active.length; i < wanted; i += 1) spawnPolice(state);
-  } else if (active.length > wanted) {
-    for (let i = 0; i < active.length - wanted; i += 1) active[i].ai.leave = true;
+  // Keep the patrol strength matched to the stars.
+  const wanted = w.stars;
+  if (police.length < wanted) {
+    const s = spawnPoint(state);
+    if (Math.hypot(s.x - px, s.y - py) > 380) {
+      const car = makeCar(s.x, s.y, 0, 'police', '#f5f6fa');
+      car.maxSpeed = 348;
+      car.cruise = 300;
+      state.cars.push(car);
+      police.push(car);
+    }
+  } else if (police.length > wanted) {
+    // Extras give up: drop the farthest one once it is well away.
+    let far = null, farD = -1;
+    for (const c of police) {
+      const d = Math.hypot(c.x - px, c.y - py);
+      if (d > farD) { farD = d; far = c; }
+    }
+    if (far && farD > 560) {
+      state.cars.splice(state.cars.indexOf(far), 1);
+    }
   }
 
-  for (const car of state.cars) {
-    if (car.kind === 'police' && car.driver === 'ai' && !car.dead) stepPoliceCar(state, car, dt);
+  // The bust meter: a patrol right on top of a slow or on-foot player.
+  let closest = Infinity;
+  for (const c of police) {
+    closest = Math.min(closest, Math.hypot(c.x - px, c.y - py));
   }
-  // Retired patrol cars that made it away leave the world.
-  for (let i = state.cars.length - 1; i >= 0; i -= 1) {
-    if (state.cars[i].ai && state.cars[i].ai.gone) state.cars.splice(i, 1);
-  }
-
-  // The arrest clock: a close officer and a slow target.
-  const nearest = police
-    .filter((c) => !c.dead && !c.ai.leave)
-    .reduce((best, c) => Math.min(best, distance(c.x, c.y, p.x, p.y)), Infinity);
   const playerSpeed = p.car ? Math.abs(p.car.speed) : 0;
-  const pinned = w.stars > 0 && nearest < (p.car ? BUST_RANGE : 58)
-    && (p.car ? playerSpeed < 38 : true);
-  if (pinned) w.bust += dt;
-  else w.bust = Math.max(0, w.bust - dt * 1.6);
-  if (w.bust >= BUST_TIME && !state.over) {
-    state.over = 'busted';
-    state.events.busted = true;
+  const pinned = w.stars > 0 && ((p.car && closest < 46 && playerSpeed < 34) || (!p.car && closest < 40));
+  if (pinned) {
+    w.bust = Math.min(100, w.bust + (24 + w.stars * 3) * dt);
+  } else {
+    w.bust = Math.max(0, w.bust - 16 * dt);
+  }
+  if (w.bust >= 100 && state.mode === 'playing') {
+    state.events.push({ type: 'arrested' });
   }
 }
